@@ -720,7 +720,10 @@ public final class TerminalView extends View {
     public boolean onKeyUp(int keyCode, KeyEvent event) {
         if (TERMINAL_VIEW_KEY_LOGGING_ENABLED)
             mClient.logInfo(LOG_TAG, "onKeyUp(keyCode=" + keyCode + ", event=" + event + ")");
-        if (mEmulator == null) return true;
+
+        // Do not return for KEYCODE_BACK and send it to the client since user may be trying
+        // to exit the activity.
+        if (mEmulator == null && keyCode != KeyEvent.KEYCODE_BACK) return true;
 
         if (mClient.onKeyUp(keyCode, event)) {
             invalidate();
@@ -756,6 +759,10 @@ public final class TerminalView extends View {
             mTermSession.updateSize(newColumns, newRows);
             mEmulator = mTermSession.getEmulator();
             mClient.onEmulatorSet();
+
+            // Update mTerminalCursorBlinkerRunnable inner class mEmulator on session change
+            if (mTerminalCursorBlinkerRunnable != null)
+                mTerminalCursorBlinkerRunnable.setEmulator(mEmulator);
 
             mTopRow = 0;
             scrollTo(0, 0);
@@ -881,19 +888,26 @@ public final class TerminalView extends View {
      * {@link #TERMINAL_CURSOR_BLINK_RATE_MIN} and {@link #TERMINAL_CURSOR_BLINK_RATE_MAX}.
      *
      * This should be called when the view holding this activity is resumed or stopped so that
-     * cursor blinker does not run when activity is not visible. Ensure that {@link #mEmulator}
-     * is set when you call this to start cursor blinking by waiting for {@link TerminalViewClient#onEmulatorSet()}
-     * event after calling {@link #attachSession(TerminalSession)} for the first session added in the
-     * activity, otherwise blinking will not start. Do not call this directly after
-     * {@link #attachSession(TerminalSession)} since {@link #updateSize()} may return without
-     * setting {@link #mEmulator} since width/height may be 0. Its called again in
-     * {@link #onSizeChanged(int, int, int, int)}.
+     * cursor blinker does not run when activity is not visible. If you call this on onResume()
+     * to start cursor blinking, then ensure that {@link #mEmulator} is set, otherwise wait for the
+     * {@link TerminalViewClient#onEmulatorSet()} event after calling {@link #attachSession(TerminalSession)}
+     * for the first session added in the activity since blinking will not start if {@link #mEmulator}
+     * is not set, like if activity is started again after exiting it with double back press. Do not
+     * call this directly after {@link #attachSession(TerminalSession)} since {@link #updateSize()}
+     * may return without setting {@link #mEmulator} since width/height may be 0. Its called again in
+     * {@link #onSizeChanged(int, int, int, int)}. Calling on onResume() if emulator is already set
+     * is necessary, since onEmulatorSet() may not be called after activity is started after device
+     * display timeout with double tap and not power button.
      *
      * It should also be called on the
      * {@link com.termux.terminal.TerminalSessionClient#onTerminalCursorStateChange(boolean)}
      * callback when cursor is enabled or disabled so that blinker is disabled if cursor is not
      * to be shown. It should also be checked if activity is visible if blinker is to be started
      * before calling this.
+     *
+     * It should also be called after terminal is reset with {@link TerminalSession#reset()} in case
+     * cursor blinker was disabled before reset due to call to
+     * {@link com.termux.terminal.TerminalSessionClient#onTerminalCursorStateChange(boolean)}.
      *
      * How cursor blinker starting works is by registering a {@link Runnable} with the looper of
      * the main thread of the app which when run, toggles the cursor blinking state and re-registers
@@ -960,7 +974,7 @@ public final class TerminalView extends View {
 
     private class TerminalCursorBlinkerRunnable implements Runnable {
 
-        private final TerminalEmulator mEmulator;
+        private TerminalEmulator mEmulator;
         private final int mBlinkRate;
 
         // Initialize with false so that initial blink state is visible after toggling
@@ -969,6 +983,10 @@ public final class TerminalView extends View {
         public TerminalCursorBlinkerRunnable(TerminalEmulator emulator, int blinkRate) {
             mEmulator = emulator;
             mBlinkRate = blinkRate;
+        }
+
+        public void setEmulator(TerminalEmulator emulator) {
+            mEmulator = emulator;
         }
 
         public void run() {

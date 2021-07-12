@@ -21,11 +21,13 @@ import android.widget.Toast;
 
 import com.termux.R;
 import com.termux.app.TermuxActivity;
+import com.termux.shared.data.UrlUtils;
 import com.termux.shared.shell.ShellUtils;
 import com.termux.shared.terminal.TermuxTerminalViewClientBase;
+import com.termux.shared.termux.AndroidUtils;
 import com.termux.shared.termux.TermuxConstants;
-import com.termux.app.activities.ReportActivity;
-import com.termux.app.models.ReportInfo;
+import com.termux.shared.activities.ReportActivity;
+import com.termux.shared.models.ReportInfo;
 import com.termux.app.models.UserAction;
 import com.termux.app.terminal.io.KeyboardShortcut;
 import com.termux.app.terminal.io.extrakeys.ExtraKeysView;
@@ -35,6 +37,7 @@ import com.termux.shared.logger.Logger;
 import com.termux.shared.markdown.MarkdownUtils;
 import com.termux.shared.termux.TermuxUtils;
 import com.termux.shared.view.KeyboardUtils;
+import com.termux.shared.view.ViewUtils;
 import com.termux.terminal.KeyHandler;
 import com.termux.terminal.TerminalEmulator;
 import com.termux.terminal.TerminalSession;
@@ -88,6 +91,7 @@ public class TermuxTerminalViewClient extends TermuxTerminalViewClientBase {
 
         // Piggyback on the terminal view key logging toggle for now, should add a separate toggle in future
         mActivity.getTermuxActivityRootView().setIsRootViewLoggingEnabled(isTerminalViewKeyLoggingEnabled);
+        ViewUtils.setIsViewUtilsLoggingEnabled(isTerminalViewKeyLoggingEnabled);
     }
 
     /**
@@ -98,6 +102,15 @@ public class TermuxTerminalViewClient extends TermuxTerminalViewClientBase {
         setSoftKeyboardState(true, false);
 
         mTerminalCursorBlinkerStateAlreadySet = false;
+
+        if (mActivity.getTerminalView().mEmulator != null) {
+            // Start terminal cursor blinking if enabled
+            // If emulator is already set, then start blinker now, otherwise wait for onEmulatorSet()
+            // event to start it. This is needed since onEmulatorSet() may not be called after
+            // TermuxActivity is started after device display timeout with double tap and not power button.
+            setTerminalCursorBlinkerState(true);
+            mTerminalCursorBlinkerStateAlreadySet = true;
+        }
     }
 
     /**
@@ -236,6 +249,13 @@ public class TermuxTerminalViewClient extends TermuxTerminalViewClientBase {
 
     @Override
     public boolean onKeyUp(int keyCode, KeyEvent e) {
+        // If emulator is not set, like if bootstrap installation failed and user dismissed the error
+        // dialog, then just exit the activity, otherwise they will be stuck in a broken state.
+        if (keyCode == KeyEvent.KEYCODE_BACK && mActivity.getTerminalView().mEmulator == null) {
+            mActivity.finishActivityIfNotFinishing();
+            return true;
+        }
+
         return handleVirtualKeys(keyCode, e, false);
     }
 
@@ -464,7 +484,13 @@ public class TermuxTerminalViewClient extends TermuxTerminalViewClientBase {
     }
 
     public void setSoftKeyboardState(boolean isStartup, boolean isReloadTermuxProperties) {
-        boolean noRequestFocus = false;
+        boolean noShowKeyboard = false;
+
+        // Requesting terminal view focus is necessary regardless of if soft keyboard is to be
+        // disabled or hidden at startup, otherwise if hardware keyboard is attached and user
+        // starts typing on hardware keyboard without tapping on the terminal first, then a colour
+        // tint will be added to the terminal as highlight for the focussed view. Test with a light
+        // theme.
 
         // If soft keyboard is disabled by user for Termux (check function docs for Termux behaviour info)
         if (KeyboardUtils.shouldSoftKeyboardBeDisabled(mActivity,
@@ -472,7 +498,8 @@ public class TermuxTerminalViewClient extends TermuxTerminalViewClientBase {
             mActivity.getPreferences().isSoftKeyboardEnabledOnlyIfNoHardware())) {
             Logger.logVerbose(LOG_TAG, "Maintaining disabled soft keyboard");
             KeyboardUtils.disableSoftKeyboard(mActivity, mActivity.getTerminalView());
-            noRequestFocus = true;
+            mActivity.getTerminalView().requestFocus();
+            noShowKeyboard = true;
             // Delay is only required if onCreate() is called like when Termux app is exited with
             // double back press, not when Termux app is switched back from another app and keyboard
             // toggle is pressed to enable keyboard
@@ -488,10 +515,12 @@ public class TermuxTerminalViewClient extends TermuxTerminalViewClientBase {
             // If soft keyboard is to be hidden on startup
             if (isStartup && mActivity.getProperties().shouldSoftKeyboardBeHiddenOnStartup()) {
                 Logger.logVerbose(LOG_TAG, "Hiding soft keyboard on startup");
-                KeyboardUtils.hideSoftKeyboard(mActivity, mActivity.getTerminalView());
                 // Required to keep keyboard hidden when Termux app is switched back from another app
                 KeyboardUtils.setSoftKeyboardAlwaysHiddenFlags(mActivity);
-                noRequestFocus = true;
+
+                KeyboardUtils.hideSoftKeyboard(mActivity, mActivity.getTerminalView());
+                mActivity.getTerminalView().requestFocus();
+                noShowKeyboard = true;
                 // Required to keep keyboard hidden on app startup
                 mShowSoftKeyboardIgnoreOnce = true;
             }
@@ -521,7 +550,7 @@ public class TermuxTerminalViewClient extends TermuxTerminalViewClientBase {
 
         // Do not force show soft keyboard if termux-reload-settings command was run with hardware keyboard
         // or soft keyboard is to be hidden or is disabled
-        if (!isReloadTermuxProperties && !noRequestFocus) {
+        if (!isReloadTermuxProperties && !noShowKeyboard) {
             // Request focus for TerminalView
             // Also show the keyboard, since onFocusChange will not be called if TerminalView already
             // had focus on startup to show the keyboard, like when opening url with context menu
@@ -585,7 +614,7 @@ public class TermuxTerminalViewClient extends TermuxTerminalViewClientBase {
 
         String text = ShellUtils.getTerminalSessionTranscriptText(session, true, true);
 
-        LinkedHashSet<CharSequence> urlSet = DataUtils.extractUrls(text);
+        LinkedHashSet<CharSequence> urlSet = UrlUtils.extractUrls(text);
         if (urlSet.isEmpty()) {
             new AlertDialog.Builder(mActivity).setMessage(R.string.title_select_url_none_found).show();
             return;
@@ -645,13 +674,13 @@ public class TermuxTerminalViewClient extends TermuxTerminalViewClientBase {
                 reportString.append("\n").append(MarkdownUtils.getMarkdownCodeForString(transcriptTextTruncated, true));
 
                 reportString.append("\n\n").append(TermuxUtils.getAppInfoMarkdownString(mActivity, true));
-                reportString.append("\n\n").append(TermuxUtils.getDeviceInfoMarkdownString(mActivity));
+                reportString.append("\n\n").append(AndroidUtils.getDeviceInfoMarkdownString(mActivity));
 
                 String termuxAptInfo = TermuxUtils.geAPTInfoMarkdownString(mActivity);
                 if (termuxAptInfo != null)
                     reportString.append("\n\n").append(termuxAptInfo);
 
-                ReportActivity.startReportActivity(mActivity, new ReportInfo(UserAction.REPORT_ISSUE_FROM_TRANSCRIPT, TermuxConstants.TERMUX_APP.TERMUX_ACTIVITY_NAME, title, null, reportString.toString(), "\n\n" + TermuxUtils.getReportIssueMarkdownString(mActivity), false));
+                ReportActivity.startReportActivity(mActivity, new ReportInfo(UserAction.REPORT_ISSUE_FROM_TRANSCRIPT.getName(), TermuxConstants.TERMUX_APP.TERMUX_ACTIVITY_NAME, title, null, reportString.toString(), "\n\n" + TermuxUtils.getReportIssueMarkdownString(mActivity), false));
             }
         }.start();
     }
